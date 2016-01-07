@@ -68,6 +68,9 @@ const (
 	// DEFAULT_ROUTE_CONNECT Route solicitation intervals.
 	DEFAULT_ROUTE_CONNECT = 1 * time.Second
 
+	// MAX_BACKOFF_TIME Maximum time for exponential backoff
+	MAX_BACKOFF_TIME = 60 * time.Second
+
 	// DEFAULT_ROUTE_RECONNECT Route reconnect intervals.
 	DEFAULT_ROUTE_RECONNECT = 1 * time.Second
 

@@ -11,8 +11,13 @@ import (
 	"net"
 	"net/url"
 	"regexp"
+	"strconv"
 	"sync/atomic"
 	"time"
+
+	"sync"
+
+	kubeclient "mnk.ee/kubeclient/client"
 )
 
 type route struct {
@@ -305,7 +310,14 @@ func (s *Server) addRoute(c *client) bool {
 		// upgrade to solicited?
 		remote.mu.Lock()
 		remote.route = c.route
+		uid := c.route.url.Query().Get("uid")
 		remote.mu.Unlock()
+		if uid != "" {
+			s.routeConnect <- DynamicRoute{
+				UID:    uid,
+				Client: remote,
+			}
+		}
 	}
 
 	return !exists
@@ -432,6 +444,8 @@ func (s *Server) StartRouting() {
 
 	// Solicit Routes if needed.
 	s.solicitRoutes()
+
+	go s.solicitDynamicRoutes()
 }
 
 func (s *Server) reConnectToRoute(rUrl *url.URL) {
@@ -440,21 +454,42 @@ func (s *Server) reConnectToRoute(rUrl *url.URL) {
 }
 
 func (s *Server) connectToRoute(rUrl *url.URL) {
+	attempts := uint64(0)
+	waitTime := DEFAULT_ROUTE_CONNECT
+
 	for s.isRunning() && rUrl != nil {
-		Debugf("Trying to connect to route on %s", rUrl.Host)
+		if IsDynamicRoute(rUrl) && !s.dynamicRoutes.IsRegistered(rUrl) {
+			Noticef("Dynamic route has been removed, not attempting reconnect: %s", rUrl.Host)
+			return
+		}
+		attempts++
+		Debugf("Trying to connect to route on %s, attempt %d", rUrl.Host, attempts)
 		conn, err := net.DialTimeout("tcp", rUrl.Host, DEFAULT_ROUTE_DIAL)
 		if err != nil {
 			Debugf("Error trying to connect to route: %v", err)
 			select {
 			case <-s.rcQuit:
 				return
-			case <-time.After(DEFAULT_ROUTE_CONNECT):
+			case <-time.After(waitTime):
+				if waitTime < MAX_BACKOFF_TIME {
+					waitTime = waitTime * 2
+					if waitTime > MAX_BACKOFF_TIME {
+						waitTime = MAX_BACKOFF_TIME
+					}
+				}
 				continue
 			}
 		}
 		// We have a route connection here.
 		// Go ahead and create it and exit this func.
-		s.createRoute(conn, rUrl)
+		client := s.createRoute(conn, rUrl)
+		uid := rUrl.Query().Get("uid")
+		if uid != "" {
+			s.routeConnect <- DynamicRoute{
+				UID:    uid,
+				Client: client,
+			}
+		}
 		return
 	}
 }
@@ -468,6 +503,205 @@ func (c *client) isSolicitedRoute() bool {
 func (s *Server) solicitRoutes() {
 	for _, r := range s.opts.Routes {
 		go s.connectToRoute(r)
+	}
+}
+
+func (s *Server) solicitDynamicRoutes() {
+	service := s.opts.KubeServiceStr
+	namespace := s.opts.KubeNamespaceStr
+	portName := s.opts.KubePortNameStr
+
+	if service == "" || namespace == "" || portName == "" {
+		Debugf("Kubernetes is not configured")
+		return
+	}
+
+	if s.opts.ClusterUsername != "" && s.opts.ClusterPassword != "" {
+		s.clusterUser = url.UserPassword(s.opts.ClusterUsername, s.opts.ClusterPassword)
+	}
+
+	srvName := fmt.Sprintf("%s.%s.svc.cluster.local", service, namespace)
+
+	s.dynamicRoutes = DynamicRouteRegistry{
+		routesByUID: map[string]*DynamicRoute{},
+	}
+	s.routeConnect = make(chan DynamicRoute)
+	s.routeDiscover = make(chan kubeclient.V1Endpoints)
+
+	selfIPs := getInterfaceIPs()
+	go s.solicitKubeRoutes(namespace, service, portName, "tcp", srvName)
+
+	addRoute := func(addr *kubeclient.V1EndpointAddress, port int32, resourceVersion string) {
+		uid := addr.TargetRef.UID
+		dr, ok := s.dynamicRoutes.Get(uid)
+
+		if ok {
+			Debugf("Not adding host already registered: %s", uid)
+			dr.ResourceVersion = resourceVersion
+			return
+		}
+		ip := addr.IP
+		if s.opts.ClusterPort == int(port) && isIpInList(selfIPs, []net.IP{net.ParseIP(ip)}) {
+			Debugf("Not adding self referencing address: %s", ip)
+			return
+		}
+		params := url.Values{}
+		params.Set("uid", uid)
+		r := &url.URL{
+			Scheme:   "nats-route",
+			User:     s.clusterUser,
+			Host:     net.JoinHostPort(ip, strconv.FormatUint(uint64(port), 10)),
+			RawQuery: params.Encode(),
+		}
+		Debugf("Adding route %s to %s:%d", uid, ip, port)
+		s.dynamicRoutes.Register(&DynamicRoute{
+			UID:             uid,
+			ResourceVersion: resourceVersion,
+		})
+		go s.connectToRoute(r)
+	}
+
+	for s.isRunning() {
+		select {
+		case dr := <-s.routeConnect:
+			existing, ok := s.dynamicRoutes.Get(dr.UID)
+			if ok {
+				existing.Client = dr.Client
+			} else {
+				Noticef("Disconnecting %s, was unregistered in race with connect", dr.UID)
+				dr.Client.closeConnection()
+			}
+		case e := <-s.routeDiscover:
+			resourceVersion := e.Metadata.ResourceVersion
+			for i := range e.Subsets {
+				port := int32(s.opts.ClusterPort)
+				for j := range e.Subsets[i].Ports {
+					if e.Subsets[i].Ports[j].Name == portName {
+						port = e.Subsets[i].Ports[j].Port
+					}
+				}
+				for j := range e.Subsets[i].NotReadyAddresses {
+					addRoute(e.Subsets[i].NotReadyAddresses[j], port, resourceVersion)
+				}
+				for j := range e.Subsets[i].Addresses {
+					addRoute(e.Subsets[i].Addresses[j], port, resourceVersion)
+				}
+			}
+			s.dynamicRoutes.EvictStale(resourceVersion)
+		}
+	}
+	close(s.routeDiscover)
+	close(s.routeConnect)
+}
+
+type DynamicRoute struct {
+	UID    string
+	Client *client
+
+	ResourceVersion string
+}
+
+type DynamicRouteRegistry struct {
+	routesByUID map[string]*DynamicRoute
+	sync.Mutex
+}
+
+func (drr *DynamicRouteRegistry) Register(dr *DynamicRoute) {
+	drr.Lock()
+	drr.routesByUID[dr.UID] = dr
+	drr.Unlock()
+}
+
+func (drr *DynamicRouteRegistry) Get(uid string) (*DynamicRoute, bool) {
+	drr.Lock()
+	dr, exists := drr.routesByUID[uid]
+	drr.Unlock()
+	return dr, exists
+}
+
+func (drr *DynamicRouteRegistry) IsRegistered(url *url.URL) bool {
+	if url == nil {
+		return false
+	}
+
+	uid := url.Query().Get("uid")
+	if uid == "" {
+		return false
+	}
+	drr.Lock()
+	_, exists := drr.routesByUID[uid]
+	drr.Unlock()
+	return exists
+}
+
+func (drr *DynamicRouteRegistry) Unregister(uid string) {
+	drr.Lock()
+	delete(drr.routesByUID, uid)
+	drr.Unlock()
+}
+
+func (drr *DynamicRouteRegistry) EvictStale(resourceVersion string) {
+	drr.Lock()
+	for uid, r := range drr.routesByUID {
+		if r.ResourceVersion != resourceVersion {
+			Debugf("Removing route %s", uid)
+			delete(drr.routesByUID, uid)
+			// prevent reconnections...
+			client := r.Client
+			if client != nil {
+				client.closeConnection()
+			}
+		}
+	}
+	drr.Unlock()
+}
+
+func IsDynamicRoute(url *url.URL) bool {
+	return url.Query().Get("uid") != ""
+}
+
+func (s *Server) solicitKubeRoutes(namespace, serviceName, portName, protocol, name string) {
+	k, err := kubeclient.NewInCluster()
+	if err != nil {
+		Errorf("Error configuring kubernetes cluster client for endpoints: namespace = %s, service = %s, port = %s: %s", namespace, serviceName, portName, err)
+		panic(err)
+		return
+	}
+
+	params := &kubeclient.ReadNamespacedEndpointsParams{
+		Namespace: namespace,
+		Name:      serviceName,
+	}
+	q, errQ := k.ReadNamespacedEndpoints(params)
+	if errQ != nil {
+		Errorf("Error contacting kubernetes cluster for endpoints: namespace = %s, service = %s, port = %s: %s", namespace, serviceName, portName, errQ)
+		panic(errQ)
+		return
+	}
+	s.routeDiscover <- *q
+
+	Debugf("read namespaced endpoints: %+v", q)
+	watch := &kubeclient.WatchNamespacedEndpointsParams{
+		Namespace:       namespace,
+		Name:            serviceName,
+		ResourceVersion: q.Metadata.ResourceVersion,
+		TimeoutSeconds:  10,
+		Watch:           true,
+	}
+	callback := func(k *kubeclient.Kubernetes, we *kubeclient.EndpointsWatchEvent) error {
+		Debugf("Got watch event: type=%s object=%+v object.subsets=%+v", we.Type, we.Object, we.Object.Subsets)
+		watch.ResourceVersion = we.Object.Metadata.ResourceVersion
+		if we.Type == "ADDED" || we.Type == "MODIFIED" {
+			s.routeDiscover <- we.Object
+		}
+		return nil
+	}
+
+	for s.isRunning() {
+		if err := k.WatchNamespacedEndpoints(watch, callback); err != nil {
+			Errorf("Error contacting kubernetes cluster for endpoints watch: namespace = %s, service = %s, port = %s: %s", namespace, serviceName, portName, err)
+			time.Sleep(1 * time.Minute)
+		}
 	}
 }
 

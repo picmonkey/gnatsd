@@ -20,7 +20,10 @@ import (
 	// Allow dynamic profiling.
 	_ "net/http/pprof"
 
+	"net/url"
+
 	"github.com/nats-io/gnatsd/sublist"
+	kubeclient "mnk.ee/kubeclient/client"
 )
 
 // Info is the information sent to clients to help them understand information
@@ -43,22 +46,27 @@ type Server struct {
 	gcid uint64
 	grid uint64
 	stats
-	mu       sync.Mutex
-	info     Info
-	infoJSON []byte
-	sl       *sublist.Sublist
-	opts     *Options
-	auth     Auth
-	trace    bool
-	debug    bool
-	running  bool
-	listener net.Listener
-	clients  map[uint64]*client
-	routes   map[uint64]*client
-	remotes  map[string]*client
-	done     chan bool
-	start    time.Time
-	http     net.Listener
+	mu            sync.Mutex
+	info          Info
+	infoJSON      []byte
+	sl            *sublist.Sublist
+	opts          *Options
+	auth          Auth
+	trace         bool
+	debug         bool
+	running       bool
+	listener      net.Listener
+	clients       map[uint64]*client
+	routes        map[uint64]*client
+	remotes       map[string]*client
+	dynamicRoutes DynamicRouteRegistry
+	routeDiscover chan kubeclient.V1Endpoints
+	routeConnect  chan DynamicRoute
+	clusterUser   *url.Userinfo
+
+	done  chan bool
+	start time.Time
+	http  net.Listener
 
 	routeListener net.Listener
 	routeInfo     Info

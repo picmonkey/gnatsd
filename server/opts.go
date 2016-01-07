@@ -46,6 +46,9 @@ type Options struct {
 	ClusterTLSTimeout  float64       `json:"-"`
 	ClusterTLSConfig   *tls.Config   `json:"-"`
 	ClusterListenStr   string        `json:"-"`
+	KubeServiceStr     string        `json:"-"`
+	KubeNamespaceStr   string        `json:"-"`
+	KubePortNameStr    string        `json:"-"`
 	ProfPort           int           `json:"-"`
 	PidFile            string        `json:"-"`
 	LogFile            string        `json:"-"`
@@ -173,6 +176,12 @@ func parseCluster(cm map[string]interface{}, opts *Options) error {
 			opts.ClusterUsername = auth.user
 			opts.ClusterPassword = auth.pass
 			opts.ClusterAuthTimeout = auth.timeout
+		case "kube_service":
+			opts.KubeServiceStr = mv.(string)
+		case "kube_namespace":
+			opts.KubeNamespaceStr = mv.(string)
+		case "kube_port_name":
+			opts.KubePortNameStr = mv.(string)
 		case "routes":
 			ra := mv.([]interface{})
 			opts.Routes = make([]*url.URL, 0, len(ra))
@@ -425,6 +434,15 @@ func MergeOptions(fileOpts, flagOpts *Options) *Options {
 	}
 	if flagOpts.RoutesStr != "" {
 		mergeRoutes(&opts, flagOpts)
+	}
+	if flagOpts.KubeServiceStr != "" {
+		opts.KubeServiceStr = flagOpts.KubeServiceStr
+	}
+	if flagOpts.KubeNamespaceStr != "" {
+		opts.KubeNamespaceStr = flagOpts.KubeNamespaceStr
+	}
+	if flagOpts.KubePortNameStr != "" {
+		opts.KubePortNameStr = flagOpts.KubePortNameStr
 	}
 	return &opts
 }
